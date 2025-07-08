@@ -3,7 +3,6 @@
 ##############################################################################
 FROM mcr.microsoft.com/cbl-mariner/base/core:2.0 AS base
 
-# Install common deps we’ll need across stages
 RUN tdnf update -y \
  && tdnf install -y \
       ca-certificates curl tar gzip unzip git icu tzdata shadow-utils \
@@ -11,7 +10,7 @@ RUN tdnf update -y \
  && tdnf clean all
 
 ##############################################################################
-# Stage 1: .NET SDK Installer (unpack the full SDK—including host/fxr)
+# Stage 1: Full .NET SDK Installer (includes host/fxr)
 ##############################################################################
 FROM base AS sdk-installer
 ARG DOTNET_SDK_VERSION=8.0.411
@@ -22,7 +21,6 @@ RUN tdnf install -y tar \
       https://dotnetcli.azureedge.net/dotnet/Sdk/${DOTNET_SDK_VERSION}/dotnet-sdk-${DOTNET_SDK_VERSION}-linux-x64.tar.gz \
       -o dotnet-sdk.tar.gz \
  && mkdir -p /dotnet \
- # ──> Extract everything so host/fxr ends up under /dotnet/host/fxr
  && tar -oxzf dotnet-sdk.tar.gz -C /dotnet \
  && rm dotnet-sdk.tar.gz
 
@@ -61,35 +59,40 @@ RUN tdnf install -y tar \
 ##############################################################################
 FROM base AS sdk-base
 
-# Copy the full SDK (with host/fxr) into place
+# Copy in the full SDK (including host/fxr)
 COPY --from=sdk-installer /dotnet /usr/share/dotnet
 
-# Symlink the CLI
 RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
 
 ##############################################################################
-# Stage 5: Build the Azure Functions Host
+# Stage 5: Build the Azure Functions Host (self-contained)
 ##############################################################################
 FROM sdk-base AS host-builder
 ARG HOST_VERSION=4.1037.0
 
-# Extra libraries needed for `dotnet publish`
+# Install only what dotnet publish needs
 RUN tdnf install -y icu tzdata unzip curl ca-certificates \
  && tdnf clean all
 
+# 1) Bump System.Drawing.Common → 4.7.2 (fixes CVE-2021-24112)
+# 2) Build self-contained host
 RUN git clone --depth 1 --branch v${HOST_VERSION} \
       https://github.com/Azure/azure-functions-host /src/azure-functions-host \
  && cd /src/azure-functions-host \
+ \
+ && sed -i \
+    's|<PackageReference Include="System.Drawing.Common" Version=".*" />|<PackageReference Include="System.Drawing.Common" Version="4.7.2" />|' \
+    src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj \
+ \
  && HOST_COMMIT=$(git rev-list -1 HEAD) \
- # Ensure System.Drawing.Common is bumped to 4.7.2 in the .csproj before publishing
- && sed -i 's|<PackageReference Include="System.Drawing.Common" Version=".*" />|<PackageReference Include="System.Drawing.Common" Version="4.7.2" />|' src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj \
  && dotnet publish src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj \
       -c Release \
-      -o /azure-functions-host \
+      --output /azure-functions-host \
       --runtime linux-x64 \
       --self-contained \
       /p:BuildNumber=$(echo ${HOST_VERSION} | cut -d'.' -f3) \
       /p:CommitHash=$HOST_COMMIT \
+ \
  && rm -rf /src/azure-functions-host /root/.nuget /root/.local
 
 ##############################################################################
@@ -98,28 +101,31 @@ RUN git clone --depth 1 --branch v${HOST_VERSION} \
 FROM base AS final
 ARG HOST_VERSION
 
-# Install minimal runtime deps
-RUN tdnf install -y dnf glibc-devel icu tzdata ca-certificates openssl-libs zlib \
+# Minimal runtime deps
+RUN tdnf install -y dnf glibc-devel icu tzdata \
+                  ca-certificates openssl-libs zlib \
  && tdnf clean all
 
-# Copy in shared runtime components
+# 1) Copy .NET runtime bits
 COPY --from=runtime-installer /dotnet /usr/share/dotnet
-COPY --from=aspnetcore-installer /dotnet/shared/Microsoft.AspNetCore.App /usr/share/dotnet/shared/Microsoft.AspNetCore.App
+# 2) Copy ASP.NET shared framework
+COPY --from=aspnetcore-installer /dotnet/shared/Microsoft.AspNetCore.App \
+                                  /usr/share/dotnet/shared/Microsoft.AspNetCore.App
 
-# Symlink the CLI
 RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
 
-# Copy the self-contained Functions Host
+# Copy self-contained Functions Host
 COPY --from=host-builder /azure-functions-host /azure-functions-host
 
-# Remove any leftover extension bundles (Java worker artifacts)
-RUN rm -rf /FunctionExtensionBundles
+
+# Strip out **all** workers & extension bundles (removes all those Java/Maven CVEs)
+RUN rm -rf /azure-functions-host/workers \
+&& rm -rf /FunctionExtensionBundles
 
 # Prepare function app folder
 RUN mkdir -p /home/site/wwwroot
 WORKDIR /home/site/wwwroot
 
-# Environment variables
 ENV \
   AzureWebJobsScriptRoot=/home/site/wwwroot \
   HOME=/home \
@@ -131,5 +137,4 @@ ENV \
   ASPNETCORE_URLS=http://+:80
 
 EXPOSE 80
-
 ENTRYPOINT ["/azure-functions-host/Microsoft.Azure.WebJobs.Script.WebHost"]
