@@ -1,60 +1,91 @@
 ##############################################################################
-# Stage 1: .NET SDK Installer
+# Stage 0: Common CBL-Mariner core base
 ##############################################################################
-FROM mcr.microsoft.com/dotnet/aspnet:8.0.17-cbl-mariner2.0-amd64 AS sdk-installer
+FROM mcr.microsoft.com/cbl-mariner/base/core:2.0 AS base
+
+# Install common deps we’ll need across stages
+RUN tdnf update -y \
+ && tdnf install -y \
+      ca-certificates curl tar gzip unzip git icu tzdata shadow-utils \
+      glibc libgcc libstdc++ openssl-libs zlib \
+ && tdnf clean all
+
+##############################################################################
+# Stage 1: .NET SDK Installer (unpack the full SDK—including host/fxr)
+##############################################################################
+FROM base AS sdk-installer
 ARG DOTNET_SDK_VERSION=8.0.411
 
-# Install tar and unpack only the SDK bits we need
 RUN tdnf install -y tar \
  && tdnf clean all \
- && curl -fSL \
+ && curl -fsSL \
       https://dotnetcli.azureedge.net/dotnet/Sdk/${DOTNET_SDK_VERSION}/dotnet-sdk-${DOTNET_SDK_VERSION}-linux-x64.tar.gz \
-      -o /tmp/dotnet-sdk.tar.gz \
+      -o dotnet-sdk.tar.gz \
  && mkdir -p /dotnet \
- && tar -oxzf /tmp/dotnet-sdk.tar.gz -C /dotnet \
-      ./packs ./sdk ./sdk-manifests ./templates ./LICENSE.txt ./ThirdPartyNotices.txt \
- && rm /tmp/dotnet-sdk.tar.gz
+ # ──> Extract everything so host/fxr ends up under /dotnet/host/fxr
+ && tar -oxzf dotnet-sdk.tar.gz -C /dotnet \
+ && rm dotnet-sdk.tar.gz
 
 ##############################################################################
-# Stage 2: SDK Image (for building the Functions Host)
+# Stage 2: ASP.NET Core Runtime Installer
 ##############################################################################
-FROM mcr.microsoft.com/dotnet/aspnet:8.0.17-cbl-mariner2.0-amd64 AS sdk-base
-ARG DOTNET_SDK_VERSION=8.0.411
+FROM base AS aspnetcore-installer
+ARG ASPNETCORE_VERSION=8.0.17
 
-ENV \
-    DOTNET_GENERATE_ASPNET_CERTIFICATE=false \
-    DOTNET_NOLOGO=true \
-    DOTNET_SDK_VERSION=${DOTNET_SDK_VERSION} \
-    DOTNET_USE_POLLING_FILE_WATCHER=true \
-    NUGET_XMLDOC_MODE=skip \
-    POWERSHELL_DISTRIBUTION_CHANNEL=PSDocker-DotnetSDK-CBL-Mariner-2.0
-
-# Install Git & runtime prerequisites, hook up dotnet CLI
-RUN tdnf install -y git libatomic_ops tar \
+RUN tdnf install -y tar \
  && tdnf clean all \
- && ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
-
-COPY --from=sdk-installer /dotnet /usr/share/dotnet
-RUN dotnet help
+ && curl -fsSL \
+      https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/${ASPNETCORE_VERSION}/aspnetcore-runtime-${ASPNETCORE_VERSION}-linux-x64.tar.gz \
+      -o aspnetcore.tar.gz \
+ && mkdir -p /dotnet \
+ && tar -oxzf aspnetcore.tar.gz -C /dotnet \
+ && rm aspnetcore.tar.gz
 
 ##############################################################################
-# Stage 3: Build the Azure Functions Host
+# Stage 3: .NET Runtime Installer
+##############################################################################
+FROM base AS runtime-installer
+ARG RUNTIME_VERSION=8.0.17
+
+RUN tdnf install -y tar \
+ && tdnf clean all \
+ && curl -fsSL \
+      https://builds.dotnet.microsoft.com/dotnet/Runtime/${RUNTIME_VERSION}/dotnet-runtime-${RUNTIME_VERSION}-linux-x64.tar.gz \
+      -o dotnet-runtime.tar.gz \
+ && mkdir -p /dotnet \
+ && tar -oxzf dotnet-runtime.tar.gz -C /dotnet \
+ && rm dotnet-runtime.tar.gz
+
+##############################################################################
+# Stage 4: SDK “Base” for building the Functions Host
+##############################################################################
+FROM base AS sdk-base
+
+# Copy the full SDK (with host/fxr) into place
+COPY --from=sdk-installer /dotnet /usr/share/dotnet
+
+# Symlink the CLI
+RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
+
+##############################################################################
+# Stage 5: Build the Azure Functions Host
 ##############################################################################
 FROM sdk-base AS host-builder
 ARG HOST_VERSION=4.1037.0
 
-# Install certificates, ICU and other libs so `dotnet publish` runs correctly
-RUN tdnf install -y ca-certificates icu tzdata unzip curl \
+# Extra libraries needed for `dotnet publish`
+RUN tdnf install -y icu tzdata unzip curl ca-certificates \
  && tdnf clean all
 
-# Clone the exact Functions Host version and publish it self-contained
 RUN git clone --depth 1 --branch v${HOST_VERSION} \
       https://github.com/Azure/azure-functions-host /src/azure-functions-host \
  && cd /src/azure-functions-host \
  && HOST_COMMIT=$(git rev-list -1 HEAD) \
+ # Ensure System.Drawing.Common is bumped to 4.7.2 in the .csproj before publishing
+ && sed -i 's|<PackageReference Include="System.Drawing.Common" Version=".*" />|<PackageReference Include="System.Drawing.Common" Version="4.7.2" />|' src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj \
  && dotnet publish src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj \
       -c Release \
-      --output /azure-functions-host \
+      -o /azure-functions-host \
       --runtime linux-x64 \
       --self-contained \
       /p:BuildNumber=$(echo ${HOST_VERSION} | cut -d'.' -f3) \
@@ -62,20 +93,33 @@ RUN git clone --depth 1 --branch v${HOST_VERSION} \
  && rm -rf /src/azure-functions-host /root/.nuget /root/.local
 
 ##############################################################################
-# Stage 4: ASP.NET Core Shared Framework Base
+# Stage 6: Final runtime image (pure CBL-Mariner core)
 ##############################################################################
-FROM mcr.microsoft.com/dotnet/aspnet:8.0.17-cbl-mariner2.0-amd64 AS aspnet-base
-
-##############################################################################
-# Stage 5: Final Image
-##############################################################################
-FROM mcr.microsoft.com/dotnet/runtime:8.0.17-cbl-mariner2.0-amd64 AS final
+FROM base AS final
 ARG HOST_VERSION
 
-# Install DNF and glibc-devel for proper runtime support of the host
-RUN tdnf install -y dnf glibc-devel \
+# Install minimal runtime deps
+RUN tdnf install -y dnf glibc-devel icu tzdata ca-certificates openssl-libs zlib \
  && tdnf clean all
 
+# Copy in shared runtime components
+COPY --from=runtime-installer /dotnet /usr/share/dotnet
+COPY --from=aspnetcore-installer /dotnet/shared/Microsoft.AspNetCore.App /usr/share/dotnet/shared/Microsoft.AspNetCore.App
+
+# Symlink the CLI
+RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
+
+# Copy the self-contained Functions Host
+COPY --from=host-builder /azure-functions-host /azure-functions-host
+
+# Remove any leftover extension bundles (Java worker artifacts)
+RUN rm -rf /FunctionExtensionBundles
+
+# Prepare function app folder
+RUN mkdir -p /home/site/wwwroot
+WORKDIR /home/site/wwwroot
+
+# Environment variables
 ENV \
   AzureWebJobsScriptRoot=/home/site/wwwroot \
   HOME=/home \
@@ -86,15 +130,6 @@ ENV \
   AzureWebJobsFeatureFlags=EnableWorkerIndexing \
   ASPNETCORE_URLS=http://+:80
 
-# Copy in the compiled Functions Host
-COPY --from=host-builder /azure-functions-host /azure-functions-host
+EXPOSE 80
 
-# Bring in the ASP.NET shared framework so HTTP/Kestrel work
-COPY --from=aspnet-base /usr/share/dotnet/shared/Microsoft.AspNetCore.App /usr/share/dotnet/shared/Microsoft.AspNetCore.App
-
-# Prepare function app folder
-RUN mkdir -p /home/site/wwwroot
-WORKDIR /home/site/wwwroot
-
-# Launch the self-contained host
 ENTRYPOINT ["/azure-functions-host/Microsoft.Azure.WebJobs.Script.WebHost"]
