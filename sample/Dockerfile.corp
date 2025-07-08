@@ -3,18 +3,17 @@
 ##############################################################################
 FROM mcr.microsoft.com/cbl-mariner/base/core:2.0 AS base
 
-# Allow passing in your org’s CA file at build time
-ARG ORG_CA_BUNDLE
-
+# install CA tools, curl, tar, etc.
 RUN tdnf update -y \
  && tdnf install -y \
-      ca-certificates curl tar gzip unzip git icu tzdata shadow-utils \
+      ca-certificates \
+      curl tar gzip unzip git icu tzdata shadow-utils \
       glibc libgcc libstdc++ openssl-libs zlib \
  && tdnf clean all
 
-# Copy in your corporate CA (if provided) and trust it
-COPY ${ORG_CA_BUNDLE} /etc/pki/ca-trust/source/anchors/org-ca.crt
-RUN update-ca-trust
+# Install your org’s root certificates (test and prod) and trust them
+COPY Deploy/certificates/*.crt /etc/pki/ca-trust/source/anchors/
+RUN update-ca-trust extract
 
 ##############################################################################
 # Stage 1: Full .NET SDK Installer (includes host/fxr)
@@ -77,20 +76,17 @@ RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
 FROM sdk-base AS host-builder
 ARG HOST_VERSION=4.1037.0
 
-# Install only what dotnet publish needs
+# only what dotnet publish needs
 RUN tdnf install -y icu tzdata unzip curl ca-certificates \
  && tdnf clean all
 
-# 1) Bump System.Drawing.Common → 4.7.2 (fixes CVE-2021-24112)
-# 2) Build self-contained host
+# patch System.Drawing.Common & publish
 RUN git clone --depth 1 --branch v${HOST_VERSION} \
       https://github.com/Azure/azure-functions-host /src/azure-functions-host \
  && cd /src/azure-functions-host \
- \
  && sed -i \
     's|<PackageReference Include="System.Drawing.Common" Version=".*" />|<PackageReference Include="System.Drawing.Common" Version="4.7.2" />|' \
     src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj \
- \
  && HOST_COMMIT=$(git rev-list -1 HEAD) \
  && dotnet publish src/WebJobs.Script.WebHost/WebJobs.Script.WebHost.csproj \
       -c Release \
@@ -99,7 +95,6 @@ RUN git clone --depth 1 --branch v${HOST_VERSION} \
       --self-contained \
       /p:BuildNumber=$(echo ${HOST_VERSION} | cut -d'.' -f3) \
       /p:CommitHash=$HOST_COMMIT \
- \
  && rm -rf /src/azure-functions-host /root/.nuget /root/.local
 
 ##############################################################################
@@ -108,28 +103,26 @@ RUN git clone --depth 1 --branch v${HOST_VERSION} \
 FROM base AS final
 ARG HOST_VERSION
 
-# Minimal runtime deps
+# minimal runtime deps
 RUN tdnf install -y dnf glibc-devel icu tzdata \
                   ca-certificates openssl-libs zlib \
  && tdnf clean all
 
-# 1) Copy .NET runtime bits
+# copy runtime + aspnet bits
 COPY --from=runtime-installer /dotnet /usr/share/dotnet
-# 2) Copy ASP.NET shared framework
 COPY --from=aspnetcore-installer /dotnet/shared/Microsoft.AspNetCore.App \
                                   /usr/share/dotnet/shared/Microsoft.AspNetCore.App
 
 RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
 
-# Copy self-contained Functions Host
+# copy the built host
 COPY --from=host-builder /azure-functions-host /azure-functions-host
 
-
-# Strip out **all** workers & extension bundles (removes all those Java/Maven CVEs)
+# strip workers & bundles
 RUN rm -rf /azure-functions-host/workers \
  && rm -rf /FunctionExtensionBundles
 
-# Prepare function app folder
+# prepare function app folder
 RUN mkdir -p /home/site/wwwroot
 WORKDIR /home/site/wwwroot
 
