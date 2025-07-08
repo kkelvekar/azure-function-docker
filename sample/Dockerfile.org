@@ -1,19 +1,28 @@
 ##############################################################################
-# Stage 0: Common CBL-Mariner core base (with corporate CA support)
+# Stage 0: Common CBL-Mariner core base (with “live” corporate CA import)
 ##############################################################################
 FROM mcr.microsoft.com/cbl-mariner/base/core:2.0 AS base
 
-# install CA tools, curl, tar, etc.
+# install the bits we need
 RUN tdnf update -y \
  && tdnf install -y \
-      ca-certificates \
+      ca-certificates    \
+      openssl            \
       curl tar gzip unzip git icu tzdata shadow-utils \
       glibc libgcc libstdc++ openssl-libs zlib \
  && tdnf clean all
 
-# Install your org’s root certificates (test and prod) and trust them
-COPY Deploy/certificates/*.crt /etc/pki/ca-trust/source/anchors/
-RUN update-ca-trust extract
+# fetch the TLS cert chain from your endpoints and trust them
+RUN set -e; \
+    for host in devcloud.ubs.net; do \
+      echo "Fetching cert for $host…"; \
+      mkdir -p /etc/pki/ca-trust/source/anchors; \
+      openssl s_client -connect "$host:443" -servername "$host" \
+        </dev/null 2>/dev/null \
+        | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' \
+        > "/etc/pki/ca-trust/source/anchors/$host.crt"; \
+    done; \
+    update-ca-trust extract
 
 ##############################################################################
 # Stage 1: Full .NET SDK Installer (includes host/fxr)
@@ -22,13 +31,13 @@ FROM base AS sdk-installer
 ARG DOTNET_SDK_VERSION=8.0.411
 
 RUN tdnf install -y tar \
- && tdnf clean all \
  && curl -fsSL \
       https://dotnetcli.azureedge.net/dotnet/Sdk/${DOTNET_SDK_VERSION}/dotnet-sdk-${DOTNET_SDK_VERSION}-linux-x64.tar.gz \
       -o dotnet-sdk.tar.gz \
  && mkdir -p /dotnet \
  && tar -oxzf dotnet-sdk.tar.gz -C /dotnet \
- && rm dotnet-sdk.tar.gz
+ && rm dotnet-sdk.tar.gz \
+ && tdnf clean all
 
 ##############################################################################
 # Stage 2: ASP.NET Core Runtime Installer
@@ -37,13 +46,13 @@ FROM base AS aspnetcore-installer
 ARG ASPNETCORE_VERSION=8.0.17
 
 RUN tdnf install -y tar \
- && tdnf clean all \
  && curl -fsSL \
       https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/${ASPNETCORE_VERSION}/aspnetcore-runtime-${ASPNETCORE_VERSION}-linux-x64.tar.gz \
       -o aspnetcore.tar.gz \
  && mkdir -p /dotnet \
  && tar -oxzf aspnetcore.tar.gz -C /dotnet \
- && rm aspnetcore.tar.gz
+ && rm aspnetcore.tar.gz \
+ && tdnf clean all
 
 ##############################################################################
 # Stage 3: .NET Runtime Installer
@@ -52,13 +61,13 @@ FROM base AS runtime-installer
 ARG RUNTIME_VERSION=8.0.17
 
 RUN tdnf install -y tar \
- && tdnf clean all \
  && curl -fsSL \
       https://builds.dotnet.microsoft.com/dotnet/Runtime/${RUNTIME_VERSION}/dotnet-runtime-${RUNTIME_VERSION}-linux-x64.tar.gz \
       -o dotnet-runtime.tar.gz \
  && mkdir -p /dotnet \
  && tar -oxzf dotnet-runtime.tar.gz -C /dotnet \
- && rm dotnet-runtime.tar.gz
+ && rm dotnet-runtime.tar.gz \
+ && tdnf clean all
 
 ##############################################################################
 # Stage 4: SDK “Base” for building the Functions Host
@@ -67,7 +76,6 @@ FROM base AS sdk-base
 
 # Copy in the full SDK (including host/fxr)
 COPY --from=sdk-installer /dotnet /usr/share/dotnet
-
 RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
 
 ##############################################################################
@@ -76,11 +84,9 @@ RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
 FROM sdk-base AS host-builder
 ARG HOST_VERSION=4.1037.0
 
-# only what dotnet publish needs
 RUN tdnf install -y icu tzdata unzip curl ca-certificates \
  && tdnf clean all
 
-# patch System.Drawing.Common & publish
 RUN git clone --depth 1 --branch v${HOST_VERSION} \
       https://github.com/Azure/azure-functions-host /src/azure-functions-host \
  && cd /src/azure-functions-host \
@@ -103,26 +109,23 @@ RUN git clone --depth 1 --branch v${HOST_VERSION} \
 FROM base AS final
 ARG HOST_VERSION
 
-# minimal runtime deps
 RUN tdnf install -y dnf glibc-devel icu tzdata \
                   ca-certificates openssl-libs zlib \
  && tdnf clean all
 
-# copy runtime + aspnet bits
+# copy .NET runtime + ASP.NET shared framework
 COPY --from=runtime-installer /dotnet /usr/share/dotnet
 COPY --from=aspnetcore-installer /dotnet/shared/Microsoft.AspNetCore.App \
                                   /usr/share/dotnet/shared/Microsoft.AspNetCore.App
-
 RUN ln -sf /usr/share/dotnet/dotnet /usr/bin/dotnet
 
-# copy the built host
+# copy in the built host
 COPY --from=host-builder /azure-functions-host /azure-functions-host
 
-# strip workers & bundles
+# strip out workers & extension bundles (removes Java/Maven CVEs)
 RUN rm -rf /azure-functions-host/workers \
  && rm -rf /FunctionExtensionBundles
 
-# prepare function app folder
 RUN mkdir -p /home/site/wwwroot
 WORKDIR /home/site/wwwroot
 
